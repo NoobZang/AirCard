@@ -25,6 +25,7 @@
 
 ## Features
 - 🎨 **Custom Card Skins:** Assign custom artwork, textures, or bank logos to Apple Pay and Wallet cards.
+- 🖍️ **Card Number Color:** Change the color of the card number on each card. Wallet appears empty after this update until you restart your iPhone.
 - 🔢 **Lock Screen Passcode Themes (.passthm):** Apply custom keypad button artwork from popular `.passthm` themes directly to iOS 18+ lockscreen.
 - 🧩 **Passcode Theme Creator:** Create custom themes from a single wallpaper (Seamless Poster Slicing) or build key-by-key (Individual Keys).
 - 🔍 **Interactive Photo Framing:** Pan and zoom artwork directly inside keypad buttons with real-time iPhone preview.
@@ -81,9 +82,12 @@ Wallet setup, detailed troubleshooting, multi-card workflows, theme creation, co
    - **Double-click the Side (Power) button** to open Apple Pay.
    - Authenticate with **Face ID**.
    - **Tap your card** (or tap it once more) to trigger instant detection!
-4. Click on any card mockup or drag & drop an image directly onto the card.
-5. Click **Flash Skins**.
+4. Click on any card mockup or drag & drop an image directly onto the card. To change the card number color, turn on **Overwrite the card number color** and pick a color.
+5. Click **Flash Cards**.
 6. Force-close the **Wallet** app on your iPhone from the App Switcher (or reboot) to see your new custom card design!
+
+> [!IMPORTANT]
+> **Card number color:** After updating the card number color, Wallet appears empty until you restart your iPhone. Leave this option off for transit cards, which have no card number.
 
 > [!NOTE]
 > **Apple Card:**
