@@ -68,10 +68,12 @@ struct WalletViewModelTests {
         try! Data([0x89, 0x50, 0x4E, 0x47]).write(to: skinURL)
         defer { try? FileManager.default.removeItem(at: skinURL) }
         var colored = CardItem(id: c)
-        colored.customImageURL = skinURL // didSet computes the skin signature
-        let plainSignature = colored.flashSignature
+        precondition(!colored.hasFlashableChange)
         colored.numberColorHex = "#112233"
-        precondition(colored.flashSignature != plainSignature)
+        precondition(colored.hasFlashableChange) // a color alone is enough to flash
+        colored.numberColorHex = nil
+        colored.customImageURL = skinURL // didSet computes the skin signature
+        precondition(colored.hasFlashableChange)
         let colorIndex = relaunched.cards.firstIndex(where: { $0.id == c })!
         relaunched.cards[colorIndex].numberColorHex = "#112233"
         let colorRelaunch = AppViewModel(cardDefaults: defaults, connectOnLaunch: false)
@@ -80,6 +82,14 @@ struct WalletViewModelTests {
         precondition(CardNumberColor.normalized("#a1b2c3") == "#A1B2C3")
         precondition(CardNumberColor.normalized("rgb(1,2,3)") == nil)
         precondition(CardNumberColor.hex(from: CardNumberColor.color(from: "#FF8000")) == "#FF8000")
+        // Runs last: assigning cards persists them into the shared test defaults.
+        let colorOnly = AppViewModel(cardDefaults: defaults, connectOnLaunch: false)
+        var colorOnlyCard = CardItem(id: "color-only")
+        colorOnlyCard.numberColorHex = "#FFFFFF"
+        colorOnly.cards = [colorOnlyCard]
+        precondition(colorOnly.isNumberColorPending(colorOnlyCard))
+        precondition(!colorOnly.isSkinPending(colorOnlyCard))
+        precondition(colorOnly.cardsNeedingFlash.map(\.id) == ["color-only"])
         print("Wallet view model migration, device isolation, repeat scans, skin identity and clear/relaunch passed")
     }
 }

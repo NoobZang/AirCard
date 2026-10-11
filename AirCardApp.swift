@@ -71,10 +71,8 @@ struct CardItem: Identifiable, Hashable {
     /// Opaque #RRGGBB card number color; nil means the card's number color is left alone.
     var numberColorHex: String? = nil
     
-    /// Identifies what a flash writes, so a color-only change still counts as pending.
-    var flashSignature: String? {
-        skinSignature.map { sig in numberColorHex.map { "\(sig)|number:\($0)" } ?? sig }
-    }
+    /// A card can be flashed with a skin, a number color, or both.
+    var hasFlashableChange: Bool { customImageURL != nil || numberColorHex != nil }
     
     static func signature(of url: URL) -> String? {
         guard let data = try? Data(contentsOf: url) else { return nil }
@@ -88,6 +86,13 @@ struct CardItem: Identifiable, Hashable {
     static func == (lhs: CardItem, rhs: CardItem) -> Bool {
         lhs.id == rhs.id && lhs.isSelected == rhs.isSelected && lhs.customImageURL == rhs.customImageURL && lhs.displayName == rhs.displayName && lhs.confirmed == rhs.confirmed && lhs.numberColorHex == rhs.numberColorHex
     }
+}
+
+/// What one card's flash writes: its skin, its number color, or both.
+struct CardFlashJob {
+    let card: CardItem
+    let writesSkin: Bool
+    let writesNumberColor: Bool
 }
 
 /// Converts between SwiftUI colors and the opaque #RRGGBB strings the backend accepts.
@@ -988,20 +993,43 @@ class AppViewModel: ObservableObject {
     
     private func flashedKey(udid: String, cardId: String) -> String { "\(udid)|\(cardId)" }
     
-    /// True when the card's current skin is already on the connected device.
+    // The skin and the number color are tracked separately so changing one
+    // never rewrites the other. Colors share the dictionary under a suffixed key.
+    private func flashedNumberColorKey(udid: String, cardId: String) -> String {
+        "\(flashedKey(udid: udid, cardId: cardId))|numberColor"
+    }
+
+    /// True when the card has a skin that is not on the connected device yet.
+    func isSkinPending(_ card: CardItem) -> Bool {
+        guard let sig = card.skinSignature else { return false }
+        guard let udid = device?.udid else { return true }
+        return flashedSkins[flashedKey(udid: udid, cardId: card.id)] != sig
+    }
+
+    /// True when the card has a number color that is not on the connected device yet.
+    func isNumberColorPending(_ card: CardItem) -> Bool {
+        guard let color = card.numberColorHex else { return false }
+        guard let udid = device?.udid else { return true }
+        return flashedSkins[flashedNumberColorKey(udid: udid, cardId: card.id)] != color
+    }
+
+    /// True when everything assigned to the card is already on the connected device.
     func isSkinFlashed(_ card: CardItem) -> Bool {
-        guard let udid = device?.udid, let sig = card.flashSignature else { return false }
-        return flashedSkins[flashedKey(udid: udid, cardId: card.id)] == sig
+        device?.udid != nil && card.hasFlashableChange && !isSkinPending(card) && !isNumberColorPending(card)
     }
     
-    /// Selected cards with a skin that differs from what was last flashed.
+    /// Selected cards with a skin or number color that differs from what was last flashed.
     var cardsNeedingFlash: [CardItem] {
-        cards.filter { $0.isSelected && $0.customImageURL != nil && !isSkinFlashed($0) }
+        cards.filter { $0.isSelected && (isSkinPending($0) || isNumberColorPending($0)) }
     }
     
-    private func markSkinFlashed(udid: String, card: CardItem) {
-        guard let sig = card.flashSignature else { return }
-        flashedSkins[flashedKey(udid: udid, cardId: card.id)] = sig
+    private func markFlashed(udid: String, cardId: String, skinSignature: String?, numberColor: String?) {
+        if let skinSignature {
+            flashedSkins[flashedKey(udid: udid, cardId: cardId)] = skinSignature
+        }
+        if let numberColor {
+            flashedSkins[flashedNumberColorKey(udid: udid, cardId: cardId)] = numberColor
+        }
         UserDefaults.standard.set(flashedSkins, forKey: flashedSkinsKey)
     }
     
@@ -1413,17 +1441,20 @@ class AppViewModel: ObservableObject {
             errorMessage = "No iPhone connected."
             return
         }
-        let allSkinned = cards.filter { $0.isSelected && $0.customImageURL != nil }
-        guard !allSkinned.isEmpty else {
-            errorMessage = "Please assign a skin image to at least one selected card."
+        let allFlashable = cards.filter { $0.isSelected && $0.hasFlashableChange }
+        guard !allFlashable.isEmpty else {
+            errorMessage = "Please assign a skin image or a card number color to at least one selected card."
             return
         }
-        // Only flash changed skins; if nothing changed, re-flash everything selected.
+        // Only flash what changed on each card; if nothing changed, re-flash
+        // everything assigned to the selected cards.
         let changed = cardsNeedingFlash
-        let selectedCardsWithSkin = changed.isEmpty ? allSkinned : changed
-        let recolored = selectedCardsWithSkin.filter { $0.numberColorHex != nil }
+        let jobs: [CardFlashJob] = changed.isEmpty
+            ? allFlashable.map { CardFlashJob(card: $0, writesSkin: $0.customImageURL != nil, writesNumberColor: $0.numberColorHex != nil) }
+            : changed.map { CardFlashJob(card: $0, writesSkin: isSkinPending($0), writesNumberColor: isNumberColorPending($0)) }
+        let recolored = jobs.filter(\.writesNumberColor)
         if !recolored.isEmpty && !numberColorConfirmed {
-            numberColorConfirmationCards = recolored.map { $0.displayName ?? $0.id }
+            numberColorConfirmationCards = recolored.map { $0.card.displayName ?? $0.card.id }
             return
         }
         
@@ -1431,18 +1462,17 @@ class AppViewModel: ObservableObject {
         showLogs = true
         progress = 0.0
         if changed.isEmpty {
-            log("No changed skins; re-flashing all \(allSkinned.count) selected card(s)...")
+            log("No changed cards; re-flashing all \(allFlashable.count) selected card(s)...")
         } else {
-            log("Starting skin application for \(changed.count) changed card(s); skipping \(allSkinned.count - changed.count) already flashed.")
+            log("Starting update for \(changed.count) changed card(s); skipping \(allFlashable.count - changed.count) already flashed.")
         }
         let scriptDir = self.scriptDir
         
         Task.detached {
             var flashFailed = false
-            let totalCards = Double(selectedCardsWithSkin.count)
-            for (idx, card) in selectedCardsWithSkin.enumerated() {
-                guard let imgURL = card.customImageURL else { continue }
-                
+            let totalCards = Double(jobs.count)
+            for (idx, job) in jobs.enumerated() {
+                let card = job.card
                 // A fresh directory per run. The old fixed /tmp path was shared
                 // between runs, so a card whose artwork failed to prepare would
                 // be flashed with whatever the previous run had left behind.
@@ -1450,39 +1480,46 @@ class AppViewModel: ObservableObject {
                     .appendingPathComponent("aircard-prep-\(UUID().uuidString)")
                 try? FileManager.default.createDirectory(at: prepDir, withIntermediateDirectories: true)
                 let preparedURL = prepDir.appendingPathComponent("card.png")
-                let preparedPath = preparedURL.path
                 defer { try? FileManager.default.removeItem(at: prepDir) }
 
                 await MainActor.run {
-                    self.statusText = "[\(idx + 1)/\(selectedCardsWithSkin.count)] Preparing skin for \(card.id.prefix(10))..."
+                    self.statusText = job.writesSkin
+                        ? "[\(idx + 1)/\(jobs.count)] Preparing skin for \(card.id.prefix(10))..."
+                        : "[\(idx + 1)/\(jobs.count)] Updating card number color for \(card.id.prefix(10))..."
                     self.progress = (Double(idx) + 0.05) / totalCards
-                    self.log("Flashing card [\(idx + 1)/\(selectedCardsWithSkin.count)]: \(card.id)")
-                }
-                
-                // 1. Prepare image natively in Swift (0 external dependencies!)
-                let prepped = AppViewModel.prepareCardImage(srcURL: imgURL, dstURL: preparedURL)
-                if !prepped {
-                    let prepProcess = Process()
-                    prepProcess.executableURL = AppViewModel.pythonExecutableURL
-                    prepProcess.environment = AppViewModel.processEnvironment
-                    prepProcess.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
-                    prepProcess.arguments = ["aircard_backend.py", "--prepare-image", imgURL.path, preparedPath]
-                    try? prepProcess.run()
-                    prepProcess.waitUntilExit()
+                    self.log("Flashing card [\(idx + 1)/\(jobs.count)]: \(card.id)")
                 }
 
-                // Neither path reports back, so check the file itself. Flashing
-                // without this writes stale or missing artwork and still calls it
-                // a success.
-                let preparedSize = (try? FileManager.default.attributesOfItem(atPath: preparedPath)[.size] as? Int) ?? nil
-                guard (preparedSize ?? 0) > 0 else {
-                    flashFailed = true
-                    let name = imgURL.lastPathComponent
-                    await MainActor.run {
-                        self.log("Could not prepare artwork from \(name); skipping this card.")
-                        self.errorMessage = "AirCard could not read the image you picked for one of the cards. That card was left unchanged."
+                // Empty path tells the backend to leave the artwork alone.
+                var preparedPath = ""
+                if job.writesSkin, let imgURL = card.customImageURL {
+                    preparedPath = preparedURL.path
+
+                    // 1. Prepare image natively in Swift (0 external dependencies!)
+                    let prepped = AppViewModel.prepareCardImage(srcURL: imgURL, dstURL: preparedURL)
+                    if !prepped {
+                        let prepProcess = Process()
+                        prepProcess.executableURL = AppViewModel.pythonExecutableURL
+                        prepProcess.environment = AppViewModel.processEnvironment
+                        prepProcess.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
+                        prepProcess.arguments = ["aircard_backend.py", "--prepare-image", imgURL.path, preparedPath]
+                        try? prepProcess.run()
+                        prepProcess.waitUntilExit()
                     }
-                    continue
+
+                    // Neither path reports back, so check the file itself. Flashing
+                    // without this writes stale or missing artwork and still calls it
+                    // a success.
+                    let preparedSize = (try? FileManager.default.attributesOfItem(atPath: preparedPath)[.size] as? Int) ?? nil
+                    guard (preparedSize ?? 0) > 0 else {
+                        flashFailed = true
+                        let name = imgURL.lastPathComponent
+                        await MainActor.run {
+                            self.log("Could not prepare artwork from \(name); skipping this card.")
+                            self.errorMessage = "AirCard could not read the image you picked for one of the cards. That card was left unchanged."
+                        }
+                        continue
+                    }
                 }
                 
                 // 2. Flash card
@@ -1491,7 +1528,7 @@ class AppViewModel: ObservableObject {
                 flashProcess.environment = AppViewModel.processEnvironment
                 flashProcess.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
                 var flashArguments = ["aircard_backend.py", "--flash", udid, card.id, preparedPath]
-                if let numberColor = card.numberColorHex {
+                if job.writesNumberColor, let numberColor = card.numberColorHex {
                     flashArguments.append(numberColor)
                 }
                 flashProcess.arguments = flashArguments
@@ -1538,7 +1575,7 @@ class AppViewModel: ObservableObject {
                             let currentProgress = (Double(idx) + subProgress) / totalCards
                             self.progress = min(currentProgress, 1.0)
                         }
-                        self.statusText = "[\(idx + 1)/\(selectedCardsWithSkin.count)] \(msg)"
+                        self.statusText = "[\(idx + 1)/\(jobs.count)] \(msg)"
                         self.log("  \(msg)")
                     }
                 }
@@ -1584,7 +1621,12 @@ class AppViewModel: ObservableObject {
                 }
                 
                 await MainActor.run {
-                    self.markSkinFlashed(udid: udid, card: card)
+                    self.markFlashed(
+                        udid: udid,
+                        cardId: card.id,
+                        skinSignature: job.writesSkin ? card.skinSignature : nil,
+                        numberColor: job.writesNumberColor ? card.numberColorHex : nil
+                    )
                     self.progress = Double(idx + 1) / totalCards
                 }
             }
@@ -1598,7 +1640,7 @@ class AppViewModel: ObservableObject {
                     self.log("Skin application stopped after a card update failed.")
                 } else {
                     self.statusText = "Complete! All cards updated."
-                    self.lastFlashUpdatedNumberColor = selectedCardsWithSkin.contains { $0.numberColorHex != nil }
+                    self.lastFlashUpdatedNumberColor = jobs.contains(where: \.writesNumberColor)
                     self.showSuccessAlert = true
                     self.log("Skins successfully applied to all selected cards!")
                 }
@@ -2158,11 +2200,11 @@ struct WalletCardView: View {
                 Spacer()
                 
                 // Status badge
-                if card.customImage != nil {
+                if card.customImage != nil || card.numberColorHex != nil {
                     Image(systemName: isFlashed ? "checkmark.circle.fill" : "arrow.up.circle.fill")
                         .foregroundColor(isFlashed ? .green : .orange)
                         .font(.system(size: 12))
-                        .help(isFlashed ? "Skin already on iPhone" : "Skin changed, will be flashed")
+                        .help(isFlashed ? "Already on iPhone" : "Changed, will be flashed")
                 }
                 
                 // Delete button
@@ -2300,7 +2342,7 @@ struct ContentView: View {
     @State private var isTargetedTheme = false
     
     private var readyToFlashCount: Int {
-        vm.cards.filter { $0.isSelected && $0.customImageURL != nil }.count
+        vm.cards.filter { $0.isSelected && $0.hasFlashableChange }.count
     }
     
     private var changedCount: Int { vm.cardsNeedingFlash.count }
@@ -3925,7 +3967,7 @@ struct ContentView: View {
                                 Image(systemName: "sparkles")
                                     .frame(width: 16, height: 16)
                             }
-                            Text(vm.isFlashing ? "Flashing Cards..." : (changedCount > 0 ? "Flash Skins (\(changedCount) Changed)" : (readyToFlashCount > 0 ? "Re-flash All (\(readyToFlashCount))" : "Flash Skins")))
+                            Text(vm.isFlashing ? "Flashing Cards..." : (changedCount > 0 ? "Flash Cards (\(changedCount) Changed)" : (readyToFlashCount > 0 ? "Re-flash All (\(readyToFlashCount))" : "Flash Cards")))
                                 .fontWeight(.semibold)
                         }
                         .padding(.horizontal, 8)

@@ -249,23 +249,34 @@ def cmd_prepare_image(src: str, dst: str):
 
 
 def cmd_flash(
-    udid: str, card_hash: str, image_path: str, card_number_color: str | None = None
+    udid: str, card_hash: str, image_path: str | None, card_number_color: str | None = None
 ) -> bool:
-    img_path = Path(image_path)
-    if not img_path.is_file():
-        print(json.dumps({"ok": False, "error": "Image file not found"}))
+    """Flash a card's artwork and/or number color.
+
+    An empty image_path means a color-only flash: artwork is left alone, but
+    the rendered cache is still cleared so Wallet redraws with the new color.
+    """
+    if not image_path and not card_number_color:
+        print(json.dumps({"ok": False, "error": "Nothing to flash"}))
         return False
 
-    try:
-        asset_payloads = build_card_assets(img_path.read_bytes())
-    except (OSError, subprocess.SubprocessError):
-        print(json.dumps({
-            "type": "error",
-            "card": card_hash,
-            "message": "Failed to prepare card artwork"
-        }))
-        sys.stdout.flush()
-        return False
+    asset_payloads: list = []
+    if image_path:
+        img_path = Path(image_path)
+        if not img_path.is_file():
+            print(json.dumps({"ok": False, "error": "Image file not found"}))
+            return False
+
+        try:
+            asset_payloads = build_card_assets(img_path.read_bytes())
+        except (OSError, subprocess.SubprocessError):
+            print(json.dumps({
+                "type": "error",
+                "card": card_hash,
+                "message": "Failed to prepare card artwork"
+            }))
+            sys.stdout.flush()
+            return False
 
     pkpass_dir = f"/var/mobile/Library/Passes/Cards/{card_hash}.pkpass"
 
@@ -290,42 +301,43 @@ def cmd_flash(
         }))
         sys.stdout.flush()
 
-    print(json.dumps({
-        "type": "progress",
-        "card": card_hash,
-        "step": 0,
-        "total": total_steps,
-        "message": f"Writing {num_assets} artwork files (fast batch)..."
-    }))
-    sys.stdout.flush()
+    if asset_payloads:
+        print(json.dumps({
+            "type": "progress",
+            "card": card_hash,
+            "step": 0,
+            "total": total_steps,
+            "message": f"Writing {num_assets} artwork files (fast batch)..."
+        }))
+        sys.stdout.flush()
 
-    try:
-        ok = write_files_batch(
-            udid,
-            pkpass_dir,
-            asset_payloads,
-            progress_callback=on_asset_progress,
-        )
-    except (OSError, RuntimeError, subprocess.SubprocessError):
-        ok = False
+        try:
+            ok = write_files_batch(
+                udid,
+                pkpass_dir,
+                asset_payloads,
+                progress_callback=on_asset_progress,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            ok = False
 
-    if not ok:
-        for file_index, (asset, payload) in enumerate(asset_payloads, 1):
-            print(json.dumps({
-                "type": "progress",
-                "card": card_hash,
-                "step": file_index,
-                "total": total_steps,
-                "leaf": asset,
-                "message": f"[Fallback] Writing {asset} ({file_index}/{total_steps})...",
-            }))
-            sys.stdout.flush()
-            try:
-                ok_single = write_file(udid, pkpass_dir, asset, payload)
-            except Exception:
-                ok_single = False
-            if not ok_single:
-                all_ok = False
+        if not ok:
+            for file_index, (asset, payload) in enumerate(asset_payloads, 1):
+                print(json.dumps({
+                    "type": "progress",
+                    "card": card_hash,
+                    "step": file_index,
+                    "total": total_steps,
+                    "leaf": asset,
+                    "message": f"[Fallback] Writing {asset} ({file_index}/{total_steps})...",
+                }))
+                sys.stdout.flush()
+                try:
+                    ok_single = write_file(udid, pkpass_dir, asset, payload)
+                except Exception:
+                    ok_single = False
+                if not ok_single:
+                    all_ok = False
 
     if card_number_color and all_ok:
         print(json.dumps({
@@ -754,7 +766,7 @@ def main():
         cmd_prepare_image(sys.argv[2], sys.argv[3])
     elif norm_cmd == "flash" and len(sys.argv) > 4:
         color = sys.argv[5] if len(sys.argv) > 5 else None
-        if not cmd_flash(sys.argv[2], sys.argv[3], sys.argv[4], color):
+        if not cmd_flash(sys.argv[2], sys.argv[3], sys.argv[4] or None, color):
             sys.exit(1)
     elif norm_cmd == "inspect-passthm" and len(sys.argv) > 2:
         cmd_inspect_passthm(sys.argv[2])

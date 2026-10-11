@@ -270,6 +270,28 @@ class CardFlashTests(unittest.TestCase):
         self.assertEqual(messages[-1]["type"], "success")
         self.assertEqual(messages[-1]["total"], 6)
 
+    def test_color_only_flash_skips_artwork_but_clears_rendered_cache(self) -> None:
+        output = io.StringIO()
+        with (
+            patch.object(aircard_backend, "write_files_batch") as write_batch,
+            patch.object(aircard_backend, "remove_files", return_value=True) as remove_files,
+            patch.object(aircard_backend, "update_card_number_color", return_value=(True, "ok")) as update_color,
+            redirect_stdout(output),
+        ):
+            result = aircard_backend.cmd_flash("device", "card", None, "#112233")
+
+        messages = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertTrue(result)
+        write_batch.assert_not_called()
+        update_color.assert_called_once_with("device", "card", "#112233")
+        self.assertTrue(remove_files.called)
+        self.assertEqual(messages[-1]["type"], "success")
+        self.assertEqual(messages[-1]["total"], 3)
+
+    def test_flash_without_image_or_color_is_rejected(self) -> None:
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(aircard_backend.cmd_flash("device", "card", None))
+
     def test_flash_skips_color_update_after_an_artwork_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             image_path = Path(temporary) / "card.png"
