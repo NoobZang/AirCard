@@ -9,8 +9,10 @@ import io
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -43,6 +45,7 @@ for lp in lib_paths:
 from apply_card_skin import (
     native,
     operation_ok,
+    read_file,
     write_file,
     write_files_batch,
     remove_files,
@@ -58,6 +61,78 @@ from aircard import (
     load_saved_cards,
     save_cards,
 )
+
+
+WALLET_PASSES_DIRECTORY = "/var/mobile/Library/Passes"
+
+
+def parse_rgb_color(value: str) -> tuple[int, int, int]:
+    """Accept an opaque #RRGGBB color as produced by the app's color picker."""
+    match = re.fullmatch(r"#([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})", value)
+    if not match:
+        raise ValueError("Card number color must be a #RRGGBB value")
+    return tuple(int(component, 16) for component in match.groups())
+
+
+def update_card_number_color(udid: str, card_hash: str, hex_color: str) -> tuple[bool, str]:
+    """Set the card number color in the pass package and Wallet's pass database.
+
+    pass.json stores foregroundColor/labelColor as rgb(r,g,b); passes23.sqlite
+    mirrors them in the pass table as rgba(r, g, b, 1.00), keyed by the same
+    unique_id used for the card's directory name. Both are prepared before
+    anything is written so a mismatch leaves the device untouched.
+    """
+    try:
+        red, green, blue = parse_rgb_color(hex_color)
+    except ValueError as error:
+        return False, str(error)
+    pass_color = f"rgb({red},{green},{blue})"
+    database_color = f"rgba({red}, {green}, {blue}, 1.00)"
+
+    pass_directory = f"{WALLET_PASSES_DIRECTORY}/Cards/{card_hash}.pkpass"
+    pass_json = read_file(udid, pass_directory, "pass.json", retries=2)
+    if not pass_json:
+        return False, "Could not read this card's pass.json"
+    try:
+        metadata = json.loads(pass_json.decode("utf-8"))
+        if not isinstance(metadata, dict):
+            raise ValueError("pass.json is not an object")
+        metadata["foregroundColor"] = pass_color
+        metadata["labelColor"] = pass_color
+        updated_pass_json = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+    except (UnicodeDecodeError, ValueError) as error:
+        return False, f"Could not update pass.json: {error}"
+
+    database = read_file(udid, WALLET_PASSES_DIRECTORY, "passes23.sqlite", retries=2)
+    if not database:
+        return False, "Could not read Wallet's pass database"
+    try:
+        with tempfile.TemporaryDirectory(prefix="aircard-pass-color-") as temporary:
+            database_path = Path(temporary) / "passes23.sqlite"
+            database_path.write_bytes(database)
+            connection = sqlite3.connect(database_path)
+            try:
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(pass)")}
+                if not {"unique_id", "foreground_color", "label_color"} <= columns:
+                    raise ValueError("Wallet pass table has an unsupported schema")
+                cursor = connection.execute(
+                    "UPDATE pass SET foreground_color = ?, label_color = ? WHERE unique_id = ?",
+                    (database_color, database_color, card_hash),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Could not find exactly one matching card in Wallet's pass database")
+                connection.commit()
+            finally:
+                connection.close()
+            updated_database = database_path.read_bytes()
+    except (OSError, sqlite3.DatabaseError, ValueError) as error:
+        return False, f"Could not update Wallet's pass database: {error}"
+
+    if not write_file(udid, pass_directory, "pass.json", updated_pass_json, retries=3):
+        return False, "Could not write this card's pass.json"
+    if not write_file(udid, WALLET_PASSES_DIRECTORY, "passes23.sqlite", updated_database, retries=3):
+        return False, "Could not write Wallet's pass database"
+    return True, "Card number color updated"
 
 
 def cmd_device(target_udid: str | None = None):
@@ -173,7 +248,9 @@ def cmd_prepare_image(src: str, dst: str):
         print(json.dumps({"ok": False, "error": str(e)}))
 
 
-def cmd_flash(udid: str, card_hash: str, image_path: str) -> bool:
+def cmd_flash(
+    udid: str, card_hash: str, image_path: str, card_number_color: str | None = None
+) -> bool:
     img_path = Path(image_path)
     if not img_path.is_file():
         print(json.dumps({"ok": False, "error": "Image file not found"}))
@@ -192,9 +269,11 @@ def cmd_flash(udid: str, card_hash: str, image_path: str) -> bool:
 
     pkpass_dir = f"/var/mobile/Library/Passes/Cards/{card_hash}.pkpass"
 
-    # One step per artwork file, then one step for each rendered-cache directory.
+    # One step per artwork file, one for the optional number color, then one
+    # step for each rendered-cache directory.
     num_assets = len(asset_payloads)
-    total_steps = num_assets + 2
+    color_steps = 1 if card_number_color else 0
+    total_steps = num_assets + color_steps + 2
     all_ok = True
 
     def on_asset_progress(event: dict) -> None:
@@ -248,10 +327,31 @@ def cmd_flash(udid: str, card_hash: str, image_path: str) -> bool:
             if not ok_single:
                 all_ok = False
 
+    if card_number_color and all_ok:
+        print(json.dumps({
+            "type": "progress",
+            "card": card_hash,
+            "step": num_assets + 1,
+            "total": total_steps,
+            "message": "Updating card number color..."
+        }))
+        sys.stdout.flush()
+        color_ok, color_message = update_card_number_color(udid, card_hash, card_number_color)
+        if not color_ok:
+            print(json.dumps({
+                "type": "error",
+                "card": card_hash,
+                "step": num_assets + 1,
+                "total": total_steps,
+                "message": color_message,
+            }))
+            sys.stdout.flush()
+            return False
+
     # Wallet only rebuilds a face after the old cache entry is gone.
     for cache_offset, ext in enumerate((".cache", ".pkcache"), start=1):
         cache_dir = f"/var/mobile/Library/Passes/Cards/{card_hash}{ext}"
-        step = num_assets + cache_offset
+        step = num_assets + color_steps + cache_offset
         print(json.dumps({
             "type": "progress",
             "card": card_hash,
@@ -653,7 +753,8 @@ def main():
     elif norm_cmd == "prepare-image" and len(sys.argv) > 3:
         cmd_prepare_image(sys.argv[2], sys.argv[3])
     elif norm_cmd == "flash" and len(sys.argv) > 4:
-        if not cmd_flash(sys.argv[2], sys.argv[3], sys.argv[4]):
+        color = sys.argv[5] if len(sys.argv) > 5 else None
+        if not cmd_flash(sys.argv[2], sys.argv[3], sys.argv[4], color):
             sys.exit(1)
     elif norm_cmd == "inspect-passthm" and len(sys.argv) > 2:
         cmd_inspect_passthm(sys.argv[2])

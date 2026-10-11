@@ -68,6 +68,13 @@ struct CardItem: Identifiable, Hashable {
     private(set) var skinSignature: String? = nil
     var displayName: String? = nil
     var confirmed: Bool = false
+    /// Opaque #RRGGBB card number color; nil means the card's number color is left alone.
+    var numberColorHex: String? = nil
+    
+    /// Identifies what a flash writes, so a color-only change still counts as pending.
+    var flashSignature: String? {
+        skinSignature.map { sig in numberColorHex.map { "\(sig)|number:\($0)" } ?? sig }
+    }
     
     static func signature(of url: URL) -> String? {
         guard let data = try? Data(contentsOf: url) else { return nil }
@@ -79,7 +86,29 @@ struct CardItem: Identifiable, Hashable {
     }
     
     static func == (lhs: CardItem, rhs: CardItem) -> Bool {
-        lhs.id == rhs.id && lhs.isSelected == rhs.isSelected && lhs.customImageURL == rhs.customImageURL && lhs.displayName == rhs.displayName && lhs.confirmed == rhs.confirmed
+        lhs.id == rhs.id && lhs.isSelected == rhs.isSelected && lhs.customImageURL == rhs.customImageURL && lhs.displayName == rhs.displayName && lhs.confirmed == rhs.confirmed && lhs.numberColorHex == rhs.numberColorHex
+    }
+}
+
+/// Converts between SwiftUI colors and the opaque #RRGGBB strings the backend accepts.
+enum CardNumberColor {
+    static func normalized(_ hex: String) -> String? {
+        let pattern = #"^#[0-9A-Fa-f]{6}$"#
+        return hex.range(of: pattern, options: .regularExpression) != nil ? hex.uppercased() : nil
+    }
+
+    static func hex(from color: Color) -> String {
+        let rgb = NSColor(color).usingColorSpace(.sRGB) ?? .white
+        func component(_ value: CGFloat) -> Int { Int((min(max(value, 0), 1) * 255).rounded()) }
+        return String(format: "#%02X%02X%02X", component(rgb.redComponent), component(rgb.greenComponent), component(rgb.blueComponent))
+    }
+
+    static func color(from hex: String) -> Color {
+        guard let value = normalized(hex).flatMap({ UInt32($0.dropFirst(), radix: 16) }) else { return .white }
+        return Color(.sRGB,
+                     red: Double((value >> 16) & 0xFF) / 255,
+                     green: Double((value >> 8) & 0xFF) / 255,
+                     blue: Double(value & 0xFF) / 255)
     }
 }
 
@@ -576,6 +605,8 @@ class AppViewModel: ObservableObject {
     @Published var statusText: String = "Ready"
     @Published var logs: [String] = []
     @Published var showSuccessAlert = false
+    /// Set when the last successful flash rewrote Wallet's pass database.
+    @Published var lastFlashUpdatedNumberColor = false
     @Published var errorMessage: String?
     
     @Published var showAddCardSheet = false
@@ -750,14 +781,16 @@ class AppViewModel: ObservableObject {
         cards = WalletSavedCard.unique(records).map { record in
             let url = record.imagePath.map { URL(fileURLWithPath: $0) }
             return CardItem(id: record.id, isSelected: record.selected, customImageURL: url,
-                            customImage: url.flatMap { NSImage(contentsOf: $0) }, confirmed: record.confirmed)
+                            customImage: url.flatMap { NSImage(contentsOf: $0) }, confirmed: record.confirmed,
+                            numberColorHex: record.numberColor.flatMap(CardNumberColor.normalized))
         }
         log("Loaded \(cards.count) saved card(s); \(confirmedCardIDs.count) previously scanned on this iPhone.")
     }
 
     func saveCards() {
         let records = WalletSavedCard.unique(cards.map {
-            WalletSavedCard(id: $0.id, confirmed: $0.confirmed, imagePath: $0.customImageURL?.path, selected: $0.isSelected)
+            WalletSavedCard(id: $0.id, confirmed: $0.confirmed, imagePath: $0.customImageURL?.path,
+                            selected: $0.isSelected, numberColor: $0.numberColorHex)
         })
         if let data = try? JSONEncoder().encode(records) {
             cardDefaults.set(data, forKey: walletStorageKey)
@@ -957,7 +990,7 @@ class AppViewModel: ObservableObject {
     
     /// True when the card's current skin is already on the connected device.
     func isSkinFlashed(_ card: CardItem) -> Bool {
-        guard let udid = device?.udid, let sig = card.skinSignature else { return false }
+        guard let udid = device?.udid, let sig = card.flashSignature else { return false }
         return flashedSkins[flashedKey(udid: udid, cardId: card.id)] == sig
     }
     
@@ -967,7 +1000,7 @@ class AppViewModel: ObservableObject {
     }
     
     private func markSkinFlashed(udid: String, card: CardItem) {
-        guard let sig = card.skinSignature else { return }
+        guard let sig = card.flashSignature else { return }
         flashedSkins[flashedKey(udid: udid, cardId: card.id)] = sig
         UserDefaults.standard.set(flashedSkins, forKey: flashedSkinsKey)
     }
@@ -1370,7 +1403,12 @@ class AppViewModel: ObservableObject {
     
     // MARK: - Skin Application
     
-    func applySkin() {
+    /// Names of the cards whose number color the next flash would rewrite.
+    /// Non-empty means the flash needs confirmation first, because it touches
+    /// Wallet's pass database and empties Wallet until the iPhone restarts.
+    @Published var numberColorConfirmationCards: [String] = []
+
+    func applySkin(numberColorConfirmed: Bool = false) {
         guard let udid = device?.udid else {
             errorMessage = "No iPhone connected."
             return
@@ -1383,6 +1421,11 @@ class AppViewModel: ObservableObject {
         // Only flash changed skins; if nothing changed, re-flash everything selected.
         let changed = cardsNeedingFlash
         let selectedCardsWithSkin = changed.isEmpty ? allSkinned : changed
+        let recolored = selectedCardsWithSkin.filter { $0.numberColorHex != nil }
+        if !recolored.isEmpty && !numberColorConfirmed {
+            numberColorConfirmationCards = recolored.map { $0.displayName ?? $0.id }
+            return
+        }
         
         isFlashing = true
         showLogs = true
@@ -1447,7 +1490,11 @@ class AppViewModel: ObservableObject {
                 flashProcess.executableURL = AppViewModel.pythonExecutableURL
                 flashProcess.environment = AppViewModel.processEnvironment
                 flashProcess.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
-                flashProcess.arguments = ["aircard_backend.py", "--flash", udid, card.id, preparedPath]
+                var flashArguments = ["aircard_backend.py", "--flash", udid, card.id, preparedPath]
+                if let numberColor = card.numberColorHex {
+                    flashArguments.append(numberColor)
+                }
+                flashProcess.arguments = flashArguments
                 
                 let pipe = Pipe()
                 let errPipe = Pipe()
@@ -1551,6 +1598,7 @@ class AppViewModel: ObservableObject {
                     self.log("Skin application stopped after a card update failed.")
                 } else {
                     self.statusText = "Complete! All cards updated."
+                    self.lastFlashUpdatedNumberColor = selectedCardsWithSkin.contains { $0.numberColorHex != nil }
                     self.showSuccessAlert = true
                     self.log("Skins successfully applied to all selected cards!")
                 }
@@ -2072,6 +2120,8 @@ struct WalletCardView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
+            numberColorRow
+
             // Bottom Info & Controls
             HStack(spacing: 8) {
                 Toggle("", isOn: $card.isSelected)
@@ -2135,6 +2185,49 @@ struct WalletCardView: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(card.isSelected ? Color.accentColor.opacity(0.3) : Color.clear, lineWidth: 1)
         )
+    }
+
+    private var overridesNumberColor: Binding<Bool> {
+        Binding(
+            get: { card.numberColorHex != nil },
+            set: { card.numberColorHex = $0 ? (card.numberColorHex ?? "#FFFFFF") : nil }
+        )
+    }
+
+    private var numberColor: Binding<Color> {
+        Binding(
+            get: { CardNumberColor.color(from: card.numberColorHex ?? "#FFFFFF") },
+            set: { card.numberColorHex = CardNumberColor.hex(from: $0) }
+        )
+    }
+
+    /// Optional per-card override for the card number dots and suffix. The row
+    /// keeps a fixed height so toggling it never resizes the card tile.
+    private var numberColorRow: some View {
+        HStack(spacing: 8) {
+            Text("Overwrite the card number color")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(card.numberColorHex != nil ? .primary : .secondary)
+                .lineLimit(1)
+
+            Spacer(minLength: 4)
+
+            ColorPicker("Card number color", selection: numberColor, supportsOpacity: false)
+                .labelsHidden()
+                .opacity(card.numberColorHex != nil ? 1 : 0)
+                .disabled(card.numberColorHex == nil)
+                .accessibilityHidden(card.numberColorHex == nil)
+
+            Toggle("Overwrite the card number color", isOn: overridesNumberColor)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+        }
+        .frame(height: 24)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
+        .cornerRadius(8)
     }
 }
 
@@ -2320,8 +2413,19 @@ struct ContentView: View {
             if vm.selectedTab == .passcodeThemes {
                 Text("Passcode theme successfully applied!\n\nLock your iPhone (or restart) to see your new passcode keypad.")
             } else {
-                Text("Skins successfully applied to all selected cards!\n\nPlease force-close the Wallet app on your iPhone (or reboot) to see your new designs.\n\nNote: Apple Card renders dynamically and its face color reflects your spending categories rather than static cached skins.")
+                Text(vm.lastFlashUpdatedNumberColor
+                    ? "Skins and card number colors successfully applied!\n\nRestart your iPhone to see your new designs. Wallet may appear empty until it restarts, because the card number color lives in Wallet's pass database.\n\nNote: Apple Card renders dynamically and its face color reflects your spending categories rather than static cached skins."
+                    : "Skins successfully applied to all selected cards!\n\nPlease force-close the Wallet app on your iPhone (or reboot) to see your new designs.\n\nNote: Apple Card renders dynamically and its face color reflects your spending categories rather than static cached skins.")
             }
+        }
+        .alert("Overwrite card number color?", isPresented: Binding(
+            get: { !vm.numberColorConfirmationCards.isEmpty },
+            set: { if !$0 { vm.numberColorConfirmationCards = [] } }
+        )) {
+            Button("Cancel", role: .cancel) {}
+            Button("Flash") { vm.applySkin(numberColorConfirmed: true) }
+        } message: {
+            Text("The card number color will be overwritten for:\n\(vm.numberColorConfirmationCards.map { "• \($0)" }.joined(separator: "\n"))\n\nWallet will appear empty after flashing. Restart your iPhone to reload it.\n\nTransit cards have no card number. Turn this option off for them.")
         }
         .sheet(isPresented: $showSupportPopup) {
             supportPopupSheet

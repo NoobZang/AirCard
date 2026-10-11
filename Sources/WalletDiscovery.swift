@@ -43,6 +43,8 @@ struct WalletSavedCard: Codable, Equatable {
     var confirmed: Bool = false
     var imagePath: String? = nil
     var selected: Bool = true
+    /// Opaque #RRGGBB card number color to write on flash; nil leaves Wallet's own color.
+    var numberColor: String? = nil
 
     static func unique(_ entries: [WalletSavedCard]) -> [WalletSavedCard] {
         var result: [WalletSavedCard] = []
@@ -51,6 +53,7 @@ struct WalletSavedCard: Codable, Equatable {
             if let index = indices[entry.id] {
                 result[index].confirmed = result[index].confirmed || entry.confirmed
                 if result[index].imagePath == nil { result[index].imagePath = entry.imagePath }
+                if result[index].numberColor == nil { result[index].numberColor = entry.numberColor }
             } else {
                 indices[entry.id] = result.count
                 result.append(entry)

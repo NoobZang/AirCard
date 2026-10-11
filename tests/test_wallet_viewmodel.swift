@@ -62,6 +62,24 @@ struct WalletViewModelTests {
         precondition(relaunched.cards.count == countBeforePreload + 1)
         precondition(relaunched.cards.first(where: { $0.id == c })?.confirmed == true)
         precondition(relaunched.currentVerifiedCards.map(\.id) == [c])
+        // Number color is opt-in per card, survives relaunch and makes a flashed card pending again.
+        precondition(relaunched.cards.allSatisfy { $0.numberColorHex == nil })
+        let skinURL = FileManager.default.temporaryDirectory.appendingPathComponent("aircard-skin-\(UUID().uuidString).png")
+        try! Data([0x89, 0x50, 0x4E, 0x47]).write(to: skinURL)
+        defer { try? FileManager.default.removeItem(at: skinURL) }
+        var colored = CardItem(id: c)
+        colored.customImageURL = skinURL // didSet computes the skin signature
+        let plainSignature = colored.flashSignature
+        colored.numberColorHex = "#112233"
+        precondition(colored.flashSignature != plainSignature)
+        let colorIndex = relaunched.cards.firstIndex(where: { $0.id == c })!
+        relaunched.cards[colorIndex].numberColorHex = "#112233"
+        let colorRelaunch = AppViewModel(cardDefaults: defaults, connectOnLaunch: false)
+        colorRelaunch.activateCardDevice("second-phone")
+        precondition(colorRelaunch.cards.first(where: { $0.id == c })?.numberColorHex == "#112233")
+        precondition(CardNumberColor.normalized("#a1b2c3") == "#A1B2C3")
+        precondition(CardNumberColor.normalized("rgb(1,2,3)") == nil)
+        precondition(CardNumberColor.hex(from: CardNumberColor.color(from: "#FF8000")) == "#FF8000")
         print("Wallet view model migration, device isolation, repeat scans, skin identity and clear/relaunch passed")
     }
 }
